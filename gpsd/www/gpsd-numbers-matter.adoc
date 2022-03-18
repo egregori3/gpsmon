@@ -1,0 +1,337 @@
+= GPSD Numbers Matter
+Gary E. Miller <gem@rellim.com>
+6 December 2021
+:author: Gary E. Miller
+:description: How and why  GPSD tortures numbers.
+:email: <gem@rellim.com>
+:keywords: gpsd, NaN, precision
+:robots: index,follow
+:sectlinks:
+:source-highlighter: rouge
+:toc: macro
+
+include::inc-menu.adoc[]
+
+== ABSTRACT
+
+Geodesy tortures numbers harder than almost any other discipline.  It
+requires that very large numbers be known to very small precision.  This
+leads to some unexpected, sometimes perplexing, choices in how *gpsd*
+handles numbers.  This white paper will explore many of those choices.
+
+== Latitude and Longitude
+
+Your GNSS receiver starts with really big, numbers. Like the Earth's
+polar radius: 6356752.314245. Then with the help of a lot of math,
+computes your position to a high precision. The u-blox ZED-F9P reports
+0.1 mm (1e-9 or 0.000000001 degree) precision. That is about 12
+decimal digits of precision. It is certainly not that accurate, maybe
+soon. No matter, *gpsd* wants to not lose the precision of the data it
+is given.
+
+12 digits of precision fits in a C double which has 15.95 decimal
+digits of precision (53 binary bits of precision). printf() format %f
+defaults to %.6f, which will truncate the result. so print with %.7f, or
+even %9f, if you have a survey grade GPS. Here is a rough idea of how
+degrees relate to distance, at the equator:
+
+|====
+|Degrees|Resolution|DMS|Distance at equator
+
+|0.0001|1e-4|0° 00′ 0.36″|11.132 m
+|0.000001|1e-6|0° 00′ 0.0036″|11.132 cm
+|0.0000001|1e-7|0° 00′ 0.00036″|11.132 mm
+|0.00000001|1e-8|0° 00′ 0.000036″|1.1132 mm
+|0.000000001|1e-9|0° 00′ 0.0000036″|0.1113 mm
+|====
+Source: <<DD>>
+
+u-blox firmware since at least protocol version 4 (Antaris 4)
+has reported latitude and longitude to 0.0000001 (1e-7) with the
+UBX-NAV-POSLLH message. At that time, 1e-7 was wildly optimistic.
+
+Starting with protocol version 20, those u-blox with High Precision
+firmware supports the UBX-NAV-HPPOSLLH message. That message reports to
+0.00000000001 (1e-9) precision, about 0.1 mm.
+
+Python floats are very similar to C doubles, plus some annoying bugs
+related to <<NaN>>.
+
+See <<DD>> for more information on Decimal Degrees and precision.
+
+== Time
+
+In the "Latitude and Longitude" section above we learned that C doubles
+are just fine for holding position information.  The same can not be said
+for "Time". There is loss of precision when storing time as a double!
+
+ * A double is 53 significant bits.
+ * POSIX time to nanoSec precision is 62 significant bits
+ * POSIX time to nanoSec precision after 2038 is 63 bits
+ * POSIX time as a double is only microSec precision
+
+That is why POSIX time as a double and PPS do not play well together.
+
+WARNING:: Loss of precision telling time as a double!
+
+That is why *gpsd* tells time using *struct timespec*.  That look like this:
+
+[source,c]
+----
+  struct timespec {
+      time_t  tv_sec;  /* Seconds */
+      long    tv_nsec; /* Nanoseconds */
+  };
+----
+
+*time_t* is usually a 64-bit integer. Older systems, and some 32-bit
+systems, define *time_t* as a 32-bit integer, which is deprecated. A
+32-bit integer will overflow at: 03:14:07 UTC on 19 January 2038. Plan
+for that apocalypse now.  Source: <<Y2038>>
+
+In 2021 cosmologists believe the age of the universe is just under
+14 billion years.  That is 4.4 e17 seconds, which fits comfortably
+into a 59 bit unsigned integer.  A 64-bit *time_t* will be good enough
+for a while longer.
+
+The other part of *timespec_t* is a long, carrying the nanosecond part
+of the time stamp.  In 2021, a GNSS receiver can tell you the start of
+every second to about 1 nano second (1 e-9 seconds) accuracy.  That fits
+comfortably into a 30 bit unsigned integer.  As long integer in C is
+always at least 32 bits.
+
+A *timespec_t* fails when you need to measure time to better than 1 nano
+second.  The SI second is defined as 9,192,631,770 cycles of radiation
+from a caesium-133 (Cs) atom.  Close to 0.1 nano seconds.  That requires
+a 34 bit unsigned integer.
+
+In 2021 the smallest frequency difference that can be measured is about
+1 second in 400 million years, one part in about 1.23 e16.  That involves
+clocks composed of strontium atoms, and measuring time differences with
+optical combs.  The time difference between those two is thus 7.9 e-17
+seconds per second.  Needing a 54 bit unsigned integer fraction of a
+second to hold it.
+
+=== Time Accuracy
+
+Just because gpsd can represent a number does not mean the number means
+what you think it does.  The u-blox ZED-F9T data sheet says it can
+output absolute PPS to 5ns.  But the fine print says: "1-sigma, fixed
+position mode, depends on temperature, atmospheric conditions, baseline
+length, GNSS antenna, multipath conditions, satellite visibility and
+geometry".
+
+There are many distinct embodiments of Universal Coordinated Time
+(UTC).  In the USA there are two, one kept by the National Institute
+of Standards and Technology (NIST] and one by the US Naval Observatory
+(USNO).  These are referred to as UTC(NIST) and UTC(USNO).  The primary
+source for UTC(NIST) is in Fort Collins Colorado.  Their secondary
+(backup) source is in Gaithersburg Maryland.  According to <<NIST2187>>,
+in 2021, the secondary UTC(NIST) site is only plus/minus 25 nano seconds
+aligned with the primary source.  Don't expect to tell time better than
+the NIST.
+
+UTC(USNO) supplies the master clock for the GPS system.  In 2020, NIST
+said that UTC(USNO) differed from UTC(NIST) by plus/minus 20 nano
+seconds. See <<NIST-USNO>>.  Even if you could track GPS time perfectly,
+and it tracked UTC(USNO) perfectly, you are still off by plus/minus 20
+nano seconds.
+
+The biggest obstacle to *gpsd* and *ntpd* keeping accurate time is the
+granularity of the local host clock.  The *gpsd* release includes a program
+called *clock_test*, and the NTPsec release includes a program in the
+attic caled *clock*.  Both can characterize your system clock.
+
+Using these programs you can determine the granularity of you system
+clock.  Some examples:
+
+|====
+|CPU |Clock speed|Clock granularity|Standard deviation
+|Raspberry Pi 3B|1.2GHz|155 ns|120 ns
+|Raspberry Pi 4B|1.5GHz|56 ns|90 ns
+|Xeon E5-1620 v3|3.50GHz|14 ns|46 ns
+|Core i5-4570|3.20GHz|11 ns|231 ns
+|Core i7-8750H|2.2GHz|18 ns|19 ns
+|Ryzen 5 3600|3.6 GHz|10 ns|60 ns
+|====
+
+Consider these best cases.  Any load, reduced clock speed, I/O
+interrupts, interrupt latency, etc. will reduce the accuracy with which
+he system clock can be read or set.  Your goal, and that of NIST stated
+in <<NIST2187>>, is that you can tell time to less than 1 micro second.
+
+== NaN ain't your Nana
+
+The most obviously confounding choice is the use in *gpsd* of *NaNs*
+(Not A Number). *gpsd* keeps track of a large number of individual
+numbers, most of them are invalid at any one time. To keep track of
+which integers are valid, a bit field is used. When an integer is
+valid, a corresponding bit is set. Keeping track of which bit matches
+which integer is challenging. <<IEEE754>> eliminates that problem with
+floating point numbers.
+
+When *gpsd* marks a floating point number invalid, it sets the value to
+<<NaN>>. So before using any *gpsd* floating point number, check that
+it is valid. C obeys <<IEEE754>>. Python sort of does, enough for our
+purposes.
+
+=== C NaN
+
+A little C program will make the behavior of <<NaN>> easy to see:
+
+[source%nowrap,c,numbered]
+----
+// Compile with: gcc nan.c -o nan
+#include <stdio.h>     // for printf()
+
+int main(int argc, char **argv)
+{
+    double a = 1.0 / 0.0;
+    double b = -1.0 / 0.0;
+    printf("a: %f b: %f\n", a, b);
+}
+----
+
+What do you expect to see whan that program is run?  Try it:
+
+----
+~ $ gcc nan.c -o nan
+~ $ ./nan
+a: inf b: -inf
+----
+
+1.0 divided by 0.0 is infinity.  -1.0 divided by 0.0 is negative infinity.
+
+Any program that printed out a lot of "inf" or -inf" would annoy the users
+and they would complain.  To avoid that, *gpsd* clients check, and print
+out "n/a" instead.
+
+Here is a common solution:
+
+[source%nowrap,c,numbered]
+----
+// Compile with: gcc nan.c -o nan
+#include <math.h>      // for isnan()
+#include <stdio.h>     // for printf()
+  
+int main(int argc, char **argv)
+{
+    double a = 1.0 / 0.0;
+    if (isnan(a)) {
+        printf("a: n/a\n");
+    } else {
+        printf("a: %f\n", a);
+    }
+}
+----
+
+What do you expect to see whan that program is run?  Try it:
+
+----
+~ $ gcc  nan.c -o nan
+~ $ ./nan
+a: inf
+----
+
+Whoops.  All <<NaN>>s are not <<NaN>>s!  Very confusing, rather than try to
+explain, I'll send you to the Wikipedia explanation: <<NaN>>.  But there
+is a simple solution.  We do not really care if a number if <<NaN>>, or if it
+is infinity.  We care that it is finite, and that is easy to test for:
+
+[source%nowrap,c,numbered]
+----
+// Compile with: gcc nan.c -o nan
+#include <math.h>      // for isfinite()
+#include <stdio.h>     // for printf()
+  
+int main(int argc, char **argv)
+{
+    double a = 1.0 / 0.0;
+    if (isfinite(a)) {
+        printf("a: %f\n", a);
+    } else {
+        printf("a: n/a\n");
+    }
+}
+----
+
+What do you expect to see whan that program is run?  Try it:
+
+----
+~ $ gcc  nan.c -o nan
+~ $ ./nan
+a: n/a
+----
+
+Exactly the desired result.  Now you know why *isfinite()* is all over
+*gpsd* client code.
+
+=== Python NaN
+
+Python is similar, it almost follows <<IEEE754>>, but has many undocumented
+"features" that conflict with <<IEEE754>>:
+
+[source%nowrap,numbered]
+----
+# python
+>>> a = 1.0 / 0.0
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+ZeroDivisionError: float division by zero
+----
+
+For shame.  It does provide a sideways method to set a variable to
+various <<NaN>>s:
+
+----
+~ $ python
+>>> Inf = float('inf')
+>>> Ninf = float('-inf')
+>>> NaN = float('NaN')
+>>> print("Inf: %f Ninf: %f NaN: %f" % (Inf, Ninf, NaN))
+Inf: inf Ninf: -inf NaN: nan
+----
+
+And *math.isnan()* and *math.isfinite()* work as expected.  Continuing
+the previous example:
+
+----
+>>> import math
+>>> math.isnan(Inf)
+False
+>>> math.isnan(NaN)
+True
+>>> math.isfinite(NaN)
+False
+>>> math.isfinite(Inf)
+False
+----
+
+And that is why *gpsd* uses *math.isfinite()* instead of *math.isnan()*.
+
+<<NaN>>s have many other interesting properties, be sure to read up on
+the subject. The <<IEEE754>> document is a closed source standard. For a
+public description look at the Wikipedia <<NaN>> article.
+
+== REFERENCES
+
+* *GPSD Project web site:* {gpsdweb}
+
+[bibliography]
+* [[[DD]]] https://en.wikipedia.org/wiki/Decimal_degrees[Decimal Degrees] Wikipedia Article
+
+* [[[Y2038]]] https://en.wikipedia.org/wiki/Year_2038_problem[2038 Problem] Wikipedia article
+
+* [[[IEEE754]]] https://standards.ieee.org/standard/754-2019.html[IEEE Standard
+for Floating-Point Arithmetic]
+
+* [[[NaN]]] https://en.wikipedia.org/wiki/NaN[NaN] Wikipedia Article
+
+* [[[NIST2187]]] https://nvlpubs.nist.gov/nistpubs/TechnicalNotes/NIST.TN.2187.pdf[NIST TN 2187]
+
+* [[NIST-USNO]] [NIST USNO] https://www.nist.gov/pml/time-and-frequency-division/time-services/nist-usno/nist-usno-2020-archive[NIST USNO]
+
+== COPYING
+
+This file is Copyright 2021 by the GPSD project +
+SPDX-License-Identifier: BSD-2-clause
